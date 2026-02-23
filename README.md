@@ -134,12 +134,6 @@ Then:
 * Resume support for large transfers
 
 ---
-
-## License
-
-Choose a license that fits your repo (e.g., MIT).
-If you want, I can generate a ready-to-paste `LICENSE` file.
-
 ```
 ```
 
