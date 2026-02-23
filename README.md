@@ -3,7 +3,6 @@
 A lightweight **SFTP file transfer GUI** built with **PySide6 (Qt)** + **Paramiko**.  
 Browse local files, browse remote SFTP directories, and **upload/download files or whole folders** with optional **tar.gz compress/extract** workflows.
 
-Source: :contentReference[oaicite:0]{index=0}
 
 ---
 
