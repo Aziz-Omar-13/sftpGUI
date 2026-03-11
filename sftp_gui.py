@@ -62,7 +62,16 @@ class SshSftpSession(QtCore.QObject):
     def is_connected(self) -> bool:
         return self.ssh is not None and self.sftp is not None
 
-    def connect(self, host: str, username: str, password: str, port: int = 22, timeout: int = 12):
+    def connect(
+        self,
+        host: str,
+        username: str,
+        password: str | None = None,
+        port: int = 22,
+        timeout: int = 12,
+        key_filename: str | None = None,
+        passphrase: str | None = None,
+    ):
         self.disconnect()
 
         self.host = host
@@ -75,12 +84,28 @@ class SshSftpSession(QtCore.QObject):
             hostname=host,
             port=port,
             username=username,
-            password=password,
+            password=password or None,
+            key_filename=key_filename or None,
+            passphrase=passphrase or None,
             timeout=timeout,
+            auth_timeout=timeout,
+            banner_timeout=timeout,
             allow_agent=False,
             look_for_keys=False,
         )
         sftp = ssh.open_sftp()
+
+        # Keep connection alive and avoid endless blocking on stale channels.
+        try:
+            t = ssh.get_transport()
+            if t:
+                t.set_keepalive(30)
+        except Exception:
+            pass
+        try:
+            sftp.get_channel().settimeout(60)
+        except Exception:
+            pass
 
         self.ssh = ssh
         self.sftp = sftp
@@ -213,17 +238,24 @@ class TransferWorker(QtCore.QObject):
     def _put_file(self, local_path: str, remote_path: str):
         sftp = self.session.sftp
         total = os.path.getsize(local_path)
+        last_pct = -1
 
         def cb(tx, _total):
+            nonlocal last_pct
             if total > 0:
                 pct = int((tx / total) * 100)
-                self.progress.emit(max(0, min(100, pct)))
+                pct = max(0, min(100, pct))
+                if pct != last_pct:
+                    last_pct = pct
+                    self.progress.emit(pct)
             if self._cancel:
                 raise RuntimeError("Cancelled")
 
         self.status.emit(f"Uploading: {os.path.basename(local_path)}")
         self.progress.emit(0)
-        sftp.put(local_path, remote_path, callback=cb)
+
+        # confirm=False avoids post-upload stat() that can hang on some servers.
+        sftp.put(local_path, remote_path, callback=cb, confirm=False)
         self.progress.emit(100)
 
     def _get_file(self, remote_path: str, local_path: str, remote_size: int | None = None):
@@ -234,10 +266,16 @@ class TransferWorker(QtCore.QObject):
             except Exception:
                 remote_size = 0
 
+        last_pct = -1
+
         def cb(tx, _total):
+            nonlocal last_pct
             if remote_size and remote_size > 0:
                 pct = int((tx / remote_size) * 100)
-                self.progress.emit(max(0, min(100, pct)))
+                pct = max(0, min(100, pct))
+                if pct != last_pct:
+                    last_pct = pct
+                    self.progress.emit(pct)
             if self._cancel:
                 raise RuntimeError("Cancelled")
 
@@ -432,6 +470,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pw = QtWidgets.QLineEdit()
         self.pw.setPlaceholderText("Password")
         self.pw.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.key_path = QtWidgets.QLineEdit()
+        self.key_path.setPlaceholderText("Private key file (optional) e.g. ~/.ssh/id_rsa")
+        self.btn_key_browse = QtWidgets.QToolButton()
+        self.btn_key_browse.setText("…")
 
         self.btn_connect = QtWidgets.QPushButton("Connect")
         self.btn_disconnect = QtWidgets.QPushButton("Disconnect")
@@ -445,6 +487,9 @@ class MainWindow(QtWidgets.QMainWindow):
         top_l.addWidget(self.user, 1, 1)
         top_l.addWidget(QtWidgets.QLabel("Password"), 1, 2)
         top_l.addWidget(self.pw, 1, 3)
+        top_l.addWidget(QtWidgets.QLabel("Private Key"), 2, 0)
+        top_l.addWidget(self.key_path, 2, 1, 1, 3)
+        top_l.addWidget(self.btn_key_browse, 2, 4, 1, 1)
         top_l.addWidget(self.btn_connect, 0, 4, 1, 1)
         top_l.addWidget(self.btn_disconnect, 1, 4, 1, 1)
 
@@ -568,6 +613,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_disconnect.clicked.connect(self.on_disconnect)
 
         self.btn_local_browse.clicked.connect(self.on_pick_local_path)
+        self.btn_key_browse.clicked.connect(self.on_pick_key_file)
         self.local_path.returnPressed.connect(self.on_local_path_changed)
 
         self.btn_remote_refresh.clicked.connect(self.refresh_remote)
@@ -591,7 +637,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Styles
         self.apply_dark_style()
-        self.write_log("Welcome. Enter Host/IP + Username + Password, then Connect.")
+        self.write_log("Welcome. Connect using password, private key, or both.")
 
     # ------------- UI / Style -------------
     def apply_dark_style(self):
@@ -685,20 +731,105 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_disconnect.setEnabled(not busy and self.session.is_connected())
 
     # ------------- Connection -------------
+    def _ask_secret(self, title: str, label: str) -> str | None:
+        val, ok = QtWidgets.QInputDialog.getText(
+            self,
+            title,
+            label,
+            QtWidgets.QLineEdit.Password,
+        )
+        if not ok:
+            return None
+        val = val.strip()
+        return val or None
+
+    def _is_key_passphrase_error(self, exc: Exception) -> bool:
+        if isinstance(exc, paramiko.PasswordRequiredException):
+            return True
+        msg = str(exc).lower()
+        return "private key file is encrypted" in msg or "incorrect passphrase" in msg
+
+    def _connect_with_fallbacks(
+        self,
+        host: str,
+        username: str,
+        port: int,
+        password: str | None,
+        key_filename: str | None,
+    ):
+        auth_password = (password or "").strip() or None
+        passphrase = None
+        passphrase_attempts = 0
+        password_prompted = False
+        last_error: Exception | None = None
+
+        for _ in range(5):
+            try:
+                self.session.connect(
+                    host,
+                    username,
+                    password=auth_password,
+                    port=port,
+                    key_filename=key_filename,
+                    passphrase=passphrase,
+                )
+                return
+            except Exception as e:
+                last_error = e
+
+                if key_filename and self._is_key_passphrase_error(e) and passphrase_attempts < 3:
+                    prompted = self._ask_secret(
+                        "Passphrase Required",
+                        f"Enter passphrase for key file:\n{key_filename}",
+                    )
+                    if prompted is None:
+                        raise RuntimeError("Connection cancelled: key passphrase is required.")
+                    passphrase = prompted
+                    passphrase_attempts += 1
+                    continue
+
+                if isinstance(e, paramiko.AuthenticationException) and not auth_password and not password_prompted:
+                    prompted = self._ask_secret(
+                        "Password Authentication",
+                        f"Server requested password for {username}@{host}:",
+                    )
+                    password_prompted = True
+                    if prompted is None:
+                        raise RuntimeError("Connection cancelled: password was required by server.")
+                    auth_password = prompted
+                    self.pw.setText(prompted)
+                    continue
+
+                raise
+
+        if last_error is not None:
+            raise last_error
+
     def on_connect(self):
         host = self.ip.text().strip()
         username = self.user.text().strip()
-        password = self.pw.text()
+        password = self.pw.text().strip()
+        key_filename = self.key_path.text().strip()
         port = int(self.port.value())
 
-        if not host or not username or not password:
-            QtWidgets.QMessageBox.warning(self, "Missing", "Please fill Host, Username, Password.")
+        if not host or not username:
+            QtWidgets.QMessageBox.warning(self, "Missing", "Please fill Host and Username.")
+            return
+
+        if key_filename:
+            key_filename = os.path.abspath(os.path.expanduser(key_filename))
+            if not os.path.isfile(key_filename):
+                QtWidgets.QMessageBox.warning(self, "Invalid key", "Private key file does not exist.")
+                return
+
+        if not password and not key_filename:
+            QtWidgets.QMessageBox.warning(self, "Missing auth", "Enter a password, a private key, or both.")
             return
 
         try:
             self.set_status("Connecting...")
             QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-            self.session.connect(host, username, password, port=port)
+            self._connect_with_fallbacks(host, username, port, password, key_filename)
             self.set_status("Connected.")
             self.refresh_remote()
         except Exception as e:
@@ -707,6 +838,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self.write_log("Connect error:\n" + traceback.format_exc())
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
+
+    def on_pick_key_file(self):
+        f, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Choose private key",
+            str(Path.home()),
+            "Private Keys (*.pem *.key *id_rsa* *id_ed25519*);;All files (*)",
+        )
+        if f:
+            self.key_path.setText(f)
 
     def on_disconnect(self):
         self.session.disconnect()
